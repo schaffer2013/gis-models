@@ -6,6 +6,7 @@ from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
+from scipy import ndimage
 
 from gis_models.config import BuildConfig, compute_uniform_xy_scale, projected_distance_m, route_width_projected_m
 from gis_models.mesh import GridModel, build_partition_mesh
@@ -21,6 +22,12 @@ from gis_models.terrain import (
 
 
 DEFAULT_KING_COUNTY_CONFIG = BuildConfig()
+LOWLAND_SMOOTHING_SIGMA_CELLS = 1.0
+LOWLAND_SMOOTHING_GRADIENT_PERCENTILE = 55.0
+HIGHLAND_SPIKE_PERCENTILE = 70.0
+HIGHLAND_SPIKE_MEDIAN_SIZE = 5
+HIGHLAND_SPIKE_BASE_ALLOWANCE_M = 14.0
+HIGHLAND_SPIKE_ALLOWANCE_GAIN = 0.08
 
 
 
@@ -47,6 +54,49 @@ def _corner_heights_from_cell_centers(cell_heights: np.ndarray) -> np.ndarray:
     return corners
 
 
+def _smooth_low_gradient_heights(cell_heights: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+    if LOWLAND_SMOOTHING_SIGMA_CELLS <= 0 or not valid_mask.any():
+        return cell_heights
+
+    grad_x = ndimage.sobel(cell_heights, axis=1, mode="nearest")
+    grad_y = ndimage.sobel(cell_heights, axis=0, mode="nearest")
+    gradient = np.hypot(grad_x, grad_y)
+    gradient_scale = float(np.percentile(gradient[valid_mask], LOWLAND_SMOOTHING_GRADIENT_PERCENTILE))
+    if gradient_scale <= 0:
+        return cell_heights
+
+    smoothed = ndimage.gaussian_filter(cell_heights, sigma=LOWLAND_SMOOTHING_SIGMA_CELLS, mode="nearest")
+    weight = np.exp(-((gradient / gradient_scale) ** 2))
+    weight *= valid_mask
+    return weight * smoothed + (1.0 - weight) * cell_heights
+
+
+def _suppress_high_elevation_spikes(cell_heights: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+    if not valid_mask.any():
+        return cell_heights
+
+    valid_heights = cell_heights[valid_mask]
+    highland_threshold = float(np.percentile(valid_heights, HIGHLAND_SPIKE_PERCENTILE))
+    local_median = ndimage.median_filter(cell_heights, size=HIGHLAND_SPIKE_MEDIAN_SIZE, mode="nearest")
+    delta = cell_heights - local_median
+
+    filtered = cell_heights.copy()
+    highland_mask = valid_mask & (cell_heights >= highland_threshold)
+    if not highland_mask.any():
+        return filtered
+
+    allowance = HIGHLAND_SPIKE_BASE_ALLOWANCE_M + HIGHLAND_SPIKE_ALLOWANCE_GAIN * np.maximum(
+        cell_heights - highland_threshold,
+        0.0,
+    )
+    filtered[highland_mask] = local_median[highland_mask] + np.clip(
+        delta[highland_mask],
+        -allowance[highland_mask],
+        allowance[highland_mask],
+    )
+    return filtered
+
+
 
 def _export_mesh(mesh, path: Path, name: str) -> None:
     if len(mesh.faces) == 0:
@@ -68,10 +118,11 @@ def build_model(config: BuildConfig) -> dict:
         county_fips=config.county_fips,
     )
     terrain_raw_m, raw_bounds, dem_crs = fetch_dem(boundary, resolution_m=config.dem_resolution_m)
-    terrain_m = resample_array(terrain_raw_m, (config.grid_resolution, config.grid_resolution))
-
     analysis_boundary = boundary.to_crs(dem_crs)
     area_geom = analysis_boundary.geometry.iloc[0]
+    raw_area_mask = rasterize_geometry_mask(area_geom, raw_bounds, terrain_raw_m.shape)
+    terrain_raw_m = fill_masked_heights(terrain_raw_m, raw_area_mask)
+    terrain_m = resample_array(terrain_raw_m, raw_bounds, dem_crs, (config.grid_resolution, config.grid_resolution))
     area_mask = rasterize_geometry_mask(area_geom, raw_bounds, terrain_m.shape)
     terrain_m = fill_masked_heights(terrain_m, area_mask)
 
@@ -110,9 +161,10 @@ def build_model(config: BuildConfig) -> dict:
         except Exception as exc:  # pragma: no cover - network/runtime variability
             print(f"Warning: failed to fetch water polygons ({exc}). Continuing without water.")
 
+    terrain_m = _smooth_low_gradient_heights(terrain_m, area_mask)
+    terrain_m = _suppress_high_elevation_spikes(terrain_m, area_mask)
     terrain_mm = terrain_m * z_scale
     terrain_mm = flatten_water(terrain_mm, water_mask, config.water_drop_mm)
-    center_z_mm = terrain_mm + config.base_thickness_mm
     corner_z_mm = _corner_heights_from_cell_centers(terrain_mm) + config.base_thickness_mm
 
     route_mask &= area_mask
@@ -121,24 +173,10 @@ def build_model(config: BuildConfig) -> dict:
 
     x_mm, y_mm = _grid_axes(raw_bounds, terrain_m.shape[0], terrain_m.shape[1], xy_scale)
     terrain_mesh, terrain_stats = build_partition_mesh(
-        GridModel(
-            x_mm=x_mm,
-            y_mm=y_mm,
-            z_mm=corner_z_mm,
-            cell_mask=terrain_only_mask,
-            base_z_mm=0.0,
-            center_z_mm=center_z_mm,
-        )
+        GridModel(x_mm=x_mm, y_mm=y_mm, z_mm=corner_z_mm, cell_mask=terrain_only_mask, base_z_mm=0.0)
     )
     route_mesh, route_stats = build_partition_mesh(
-        GridModel(
-            x_mm=x_mm,
-            y_mm=y_mm,
-            z_mm=corner_z_mm,
-            cell_mask=route_mask,
-            base_z_mm=0.0,
-            center_z_mm=center_z_mm,
-        )
+        GridModel(x_mm=x_mm, y_mm=y_mm, z_mm=corner_z_mm, cell_mask=route_mask, base_z_mm=0.0)
     )
 
     terrain_path = config.output_dir / "terrain_body.stl"

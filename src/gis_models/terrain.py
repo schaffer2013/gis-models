@@ -29,7 +29,6 @@ def fetch_dem(
     x = np.asarray(dem.x, dtype=float)
     y = np.asarray(dem.y, dtype=float)
     bounds = (float(x.min()), float(y.min()), float(x.max()), float(y.max()))
-    array = np.flipud(array)
     return array, bounds, dem_crs
 
 
@@ -53,20 +52,27 @@ def rasterize_geometry_mask(
 
 
 
-def resample_array(array: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+def resample_array(
+    array: np.ndarray,
+    bounds: tuple[float, float, float, float],
+    crs: CRS,
+    shape: tuple[int, int],
+) -> np.ndarray:
     import rasterio.warp
 
-    src_transform = from_bounds(0, 0, array.shape[1], array.shape[0], width=array.shape[1], height=array.shape[0])
-    dst_transform = from_bounds(0, 0, shape[1], shape[0], width=shape[1], height=shape[0])
+    src_transform = from_bounds(*bounds, width=array.shape[1], height=array.shape[0])
+    dst_transform = from_bounds(*bounds, width=shape[1], height=shape[0])
     dst = np.empty(shape, dtype=np.float32)
     rasterio.warp.reproject(
         source=array,
         destination=dst,
         src_transform=src_transform,
-        src_crs="EPSG:3857",
+        src_crs=str(crs),
         dst_transform=dst_transform,
-        dst_crs="EPSG:3857",
+        dst_crs=str(crs),
         resampling=Resampling.bilinear,
+        src_nodata=np.nan,
+        dst_nodata=np.nan,
     )
     return dst
 

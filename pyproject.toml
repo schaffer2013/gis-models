@@ -40,3 +40,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+  "gis_validation: compares generated terrain ROI statistics against source GIS elevation data",
+]

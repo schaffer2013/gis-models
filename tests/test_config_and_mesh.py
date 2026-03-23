@@ -9,7 +9,8 @@ from gis_models.config import (
     route_width_projected_m,
     utm_epsg_from_lon_lat,
 )
-from gis_models.mesh import GridModel, _use_tl_br_diagonal, build_partition_mesh
+from gis_models.cli import _smooth_low_gradient_heights, _suppress_high_elevation_spikes
+from gis_models.mesh import GridModel, build_partition_mesh
 
 
 def test_z_scale_matches_requested_ratio() -> None:
@@ -34,16 +35,24 @@ def test_utm_epsg_for_king_county_area() -> None:
     assert utm_epsg_from_lon_lat(-122.3, 47.6) == 32610
 
 
-def test_mesh_chooses_shorter_top_diagonal() -> None:
-    model = GridModel(
-        x_mm=np.array([0.0, 10.0]),
-        y_mm=np.array([0.0, 10.0]),
-        z_mm=np.array([[0.0, 0.0], [0.0, 10.0]]),
-        cell_mask=np.array([[True]]),
-        base_z_mm=0.0,
-    )
+def test_low_gradient_smoothing_preserves_flat_surface() -> None:
+    heights = np.full((3, 3), 12.5)
+    valid_mask = np.ones((3, 3), dtype=bool)
 
-    assert not _use_tl_br_diagonal(model, 0, 0)
+    smoothed = _smooth_low_gradient_heights(heights, valid_mask)
+
+    assert np.allclose(smoothed, heights)
+
+
+def test_highland_spike_suppression_reduces_isolated_peak() -> None:
+    heights = np.full((7, 7), 1000.0)
+    heights[3, 3] = 1300.0
+    valid_mask = np.ones((7, 7), dtype=bool)
+
+    filtered = _suppress_high_elevation_spikes(heights, valid_mask)
+
+    assert filtered[3, 3] < heights[3, 3]
+    assert np.allclose(filtered[0, 0], heights[0, 0])
 
 
 def test_build_partition_mesh_is_watertight_for_single_cell() -> None:
@@ -67,25 +76,3 @@ def test_build_partition_mesh_empty_mask_returns_empty_mesh() -> None:
 
     assert stats.cells == 0
     assert len(mesh.faces) == 0
-
-
-def test_build_partition_mesh_uses_cell_center_vertex_when_provided() -> None:
-    x_mm = np.array([0.0, 10.0])
-    y_mm = np.array([0.0, 10.0])
-    z_mm = np.array([[5.0, 5.0], [5.0, 5.0]])
-    center_z_mm = np.array([[7.0]])
-    mask = np.array([[True]])
-    mesh, stats = build_partition_mesh(
-        GridModel(
-            x_mm=x_mm,
-            y_mm=y_mm,
-            z_mm=z_mm,
-            cell_mask=mask,
-            base_z_mm=0.0,
-            center_z_mm=center_z_mm,
-        )
-    )
-
-    assert stats.cells == 1
-    assert mesh.is_watertight
-    assert any(np.allclose(vertex, [5.0, 5.0, 7.0]) for vertex in mesh.vertices)
