@@ -13,6 +13,7 @@ class GridModel:
     z_mm: np.ndarray
     cell_mask: np.ndarray
     base_z_mm: float
+    center_z_mm: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -22,10 +23,22 @@ class MeshStats:
     cells: int
 
 
+def _use_tl_br_diagonal(model: GridModel, i: int, j: int) -> bool:
+    tl = np.array([model.x_mm[j], model.y_mm[i], model.z_mm[i, j]], dtype=float)
+    tr = np.array([model.x_mm[j + 1], model.y_mm[i], model.z_mm[i, j + 1]], dtype=float)
+    bl = np.array([model.x_mm[j], model.y_mm[i + 1], model.z_mm[i + 1, j]], dtype=float)
+    br = np.array([model.x_mm[j + 1], model.y_mm[i + 1], model.z_mm[i + 1, j + 1]], dtype=float)
+    tl_br = np.linalg.norm(br - tl)
+    tr_bl = np.linalg.norm(bl - tr)
+    return tl_br <= tr_bl
+
+
 def build_partition_mesh(model: GridModel) -> tuple[trimesh.Trimesh, MeshStats]:
     rows, cols = model.cell_mask.shape
     if model.z_mm.shape != (rows + 1, cols + 1):
         raise ValueError("z_mm must be defined on grid corners")
+    if model.center_z_mm is not None and model.center_z_mm.shape != (rows, cols):
+        raise ValueError("center_z_mm must be defined on grid cells")
 
     top_vertex_map: dict[tuple[int, int], int] = {}
     bottom_vertex_map: dict[tuple[int, int], int] = {}
@@ -69,9 +82,32 @@ def build_partition_mesh(model: GridModel) -> tuple[trimesh.Trimesh, MeshStats]:
             bbl = bottom_idx(i + 1, j)
             bbr = bottom_idx(i + 1, j + 1)
 
+            if model.center_z_mm is not None:
+                c = len(vertices)
+                vertices.append([
+                    float((model.x_mm[j] + model.x_mm[j + 1]) / 2.0),
+                    float((model.y_mm[i] + model.y_mm[i + 1]) / 2.0),
+                    float(model.center_z_mm[i, j]),
+                ])
+                faces.extend([
+                    [tl, bl, c],
+                    [bl, br, c],
+                    [br, tr, c],
+                    [tr, tl, c],
+                ])
+            else:
+                if _use_tl_br_diagonal(model, i, j):
+                    faces.extend([
+                        [tl, bl, br],
+                        [tl, br, tr],
+                    ])
+                else:
+                    faces.extend([
+                        [tl, bl, tr],
+                        [tr, bl, br],
+                    ])
+
             faces.extend([
-                [tl, bl, br],
-                [tl, br, tr],
                 [btl, bbr, bbl],
                 [btl, btr, bbr],
             ])
@@ -91,8 +127,8 @@ def build_partition_mesh(model: GridModel) -> tuple[trimesh.Trimesh, MeshStats]:
                 ])
 
     mesh = trimesh.Trimesh(vertices=np.asarray(vertices), faces=np.asarray(faces, dtype=np.int64), process=True)
-    mesh.remove_duplicate_faces()
+    mesh.update_faces(mesh.unique_faces())
+    mesh.update_faces(mesh.nondegenerate_faces())
     mesh.remove_unreferenced_vertices()
-    mesh.remove_degenerate_faces()
     mesh.fix_normals()
     return mesh, MeshStats(vertices=len(mesh.vertices), faces=len(mesh.faces), cells=cell_count)

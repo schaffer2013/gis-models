@@ -7,7 +7,7 @@ from pathlib import Path
 import geopandas as gpd
 import numpy as np
 
-from gis_models.config import BuildConfig, compute_uniform_xy_scale, route_width_projected_m
+from gis_models.config import BuildConfig, compute_uniform_xy_scale, projected_distance_m, route_width_projected_m
 from gis_models.mesh import GridModel, build_partition_mesh
 from gis_models.sources import fetch_water_polygons, load_boundary_geometry, load_route_from_kmz, write_metadata
 from gis_models.terrain import (
@@ -58,6 +58,8 @@ def _export_mesh(mesh, path: Path, name: str) -> None:
 
 def build_model(config: BuildConfig) -> dict:
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    if config.body_gap_mm < 0:
+        raise ValueError("body_gap_mm must be non-negative")
 
     boundary, target_crs, boundary_source = load_boundary_geometry(
         boundary_file=config.boundary_file,
@@ -65,10 +67,11 @@ def build_model(config: BuildConfig) -> dict:
         state_fips=config.state_fips,
         county_fips=config.county_fips,
     )
-    terrain_raw_m, raw_bounds = fetch_dem(boundary, resolution_m=config.dem_resolution_m)
+    terrain_raw_m, raw_bounds, dem_crs = fetch_dem(boundary, resolution_m=config.dem_resolution_m)
     terrain_m = resample_array(terrain_raw_m, (config.grid_resolution, config.grid_resolution))
 
-    area_geom = boundary.geometry.iloc[0]
+    analysis_boundary = boundary.to_crs(dem_crs)
+    area_geom = analysis_boundary.geometry.iloc[0]
     area_mask = rasterize_geometry_mask(area_geom, raw_bounds, terrain_m.shape)
     terrain_m = fill_masked_heights(terrain_m, area_mask)
 
@@ -76,13 +79,25 @@ def build_model(config: BuildConfig) -> dict:
     z_scale = config.z_mm_per_meter
 
     route_mask = np.zeros_like(area_mask)
+    terrain_gap_mask = np.zeros_like(area_mask)
     route_feature = None
     route_width_projected = 0.0
+    body_gap_projected = 0.0
     if config.kmz_file:
         route_feature = load_route_from_kmz(config.kmz_file, target_crs=target_crs)
+        route_feature_analysis = gpd.GeoSeries([route_feature], crs=target_crs).to_crs(dem_crs).iloc[0]
         route_width_projected = route_width_projected_m(config.route_width_mm, xy_scale)
-        route_buffer = route_feature.buffer(route_width_projected / 2.0, cap_style=2, join_style=2)
+        body_gap_projected = projected_distance_m(config.body_gap_mm, xy_scale)
+        route_buffer = route_feature_analysis.buffer(route_width_projected / 2.0, cap_style=2, join_style=2)
         route_mask = rasterize_geometry_mask(route_buffer, raw_bounds, terrain_m.shape) & area_mask
+        terrain_gap_mask = route_mask
+        if body_gap_projected > 0.0:
+            terrain_gap_buffer = route_feature_analysis.buffer(
+                (route_width_projected + body_gap_projected) / 2.0,
+                cap_style=2,
+                join_style=2,
+            )
+            terrain_gap_mask = rasterize_geometry_mask(terrain_gap_buffer, raw_bounds, terrain_m.shape) & area_mask
 
     water_mask = np.zeros_like(area_mask)
     if config.include_water:
@@ -90,23 +105,40 @@ def build_model(config: BuildConfig) -> dict:
             water_geoms = fetch_water_polygons(boundary)
             water_union = union_geometries(water_geoms)
             if not water_union.is_empty:
+                water_union = gpd.GeoSeries([water_union], crs=boundary.crs).to_crs(dem_crs).iloc[0]
                 water_mask = rasterize_geometry_mask(water_union, raw_bounds, terrain_m.shape) & area_mask
         except Exception as exc:  # pragma: no cover - network/runtime variability
             print(f"Warning: failed to fetch water polygons ({exc}). Continuing without water.")
 
     terrain_mm = terrain_m * z_scale
     terrain_mm = flatten_water(terrain_mm, water_mask, config.water_drop_mm)
+    center_z_mm = terrain_mm + config.base_thickness_mm
     corner_z_mm = _corner_heights_from_cell_centers(terrain_mm) + config.base_thickness_mm
 
     route_mask &= area_mask
-    terrain_only_mask = area_mask & ~route_mask
+    terrain_gap_mask &= area_mask
+    terrain_only_mask = area_mask & ~terrain_gap_mask
 
     x_mm, y_mm = _grid_axes(raw_bounds, terrain_m.shape[0], terrain_m.shape[1], xy_scale)
     terrain_mesh, terrain_stats = build_partition_mesh(
-        GridModel(x_mm=x_mm, y_mm=y_mm, z_mm=corner_z_mm, cell_mask=terrain_only_mask, base_z_mm=0.0)
+        GridModel(
+            x_mm=x_mm,
+            y_mm=y_mm,
+            z_mm=corner_z_mm,
+            cell_mask=terrain_only_mask,
+            base_z_mm=0.0,
+            center_z_mm=center_z_mm,
+        )
     )
     route_mesh, route_stats = build_partition_mesh(
-        GridModel(x_mm=x_mm, y_mm=y_mm, z_mm=corner_z_mm, cell_mask=route_mask, base_z_mm=0.0)
+        GridModel(
+            x_mm=x_mm,
+            y_mm=y_mm,
+            z_mm=corner_z_mm,
+            cell_mask=route_mask,
+            base_z_mm=0.0,
+            center_z_mm=center_z_mm,
+        )
     )
 
     terrain_path = config.output_dir / "terrain_body.stl"
@@ -119,6 +151,7 @@ def build_model(config: BuildConfig) -> dict:
         "boundary": {
             **boundary_source,
             "target_crs": str(target_crs),
+            "dem_crs": str(dem_crs),
             "bounds_m": {
                 "min_x": raw_bounds[0],
                 "min_y": raw_bounds[1],
@@ -128,8 +161,10 @@ def build_model(config: BuildConfig) -> dict:
         },
         "xy_scale_mm_per_m": xy_scale,
         "route_width_projected_m": route_width_projected,
+        "body_gap_projected_m": body_gap_projected,
         "area_cells": int(area_mask.sum()),
         "route_cells": int(route_mask.sum()),
+        "terrain_gap_cells": int(terrain_gap_mask.sum()),
         "water_cells": int(water_mask.sum()),
         "terrain_mesh": asdict(terrain_stats),
         "route_mesh": asdict(route_stats),
@@ -158,6 +193,12 @@ def _add_common_build_arguments(parser: argparse.ArgumentParser, *, king_default
         default=DEFAULT_KING_COUNTY_CONFIG.elevation_mm_per_1000_ft,
     )
     parser.add_argument("--route-width-mm", type=float, default=DEFAULT_KING_COUNTY_CONFIG.route_width_mm)
+    parser.add_argument(
+        "--body-gap-mm",
+        type=float,
+        default=DEFAULT_KING_COUNTY_CONFIG.body_gap_mm,
+        help="Additional XY clearance removed from the terrain body around the route insert.",
+    )
     parser.add_argument("--base-thickness-mm", type=float, default=DEFAULT_KING_COUNTY_CONFIG.base_thickness_mm)
     parser.add_argument("--water-drop-mm", type=float, default=DEFAULT_KING_COUNTY_CONFIG.water_drop_mm)
     parser.add_argument("--grid-resolution", type=int, default=DEFAULT_KING_COUNTY_CONFIG.grid_resolution)
@@ -197,6 +238,7 @@ def _config_from_args(args: argparse.Namespace, *, king_county_defaults: bool) -
         output_height_mm=args.output_height_mm,
         elevation_mm_per_1000_ft=args.elevation_mm_per_1000_ft,
         route_width_mm=args.route_width_mm,
+        body_gap_mm=args.body_gap_mm,
         base_thickness_mm=args.base_thickness_mm,
         water_drop_mm=args.water_drop_mm,
         grid_resolution=args.grid_resolution,

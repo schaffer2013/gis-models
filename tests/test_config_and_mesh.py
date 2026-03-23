@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import numpy as np
 
-from gis_models.config import BuildConfig, compute_uniform_xy_scale, route_width_projected_m, utm_epsg_from_lon_lat
-from gis_models.mesh import GridModel, build_partition_mesh
+from gis_models.config import (
+    BuildConfig,
+    compute_uniform_xy_scale,
+    projected_distance_m,
+    route_width_projected_m,
+    utm_epsg_from_lon_lat,
+)
+from gis_models.mesh import GridModel, _use_tl_br_diagonal, build_partition_mesh
 
 
 def test_z_scale_matches_requested_ratio() -> None:
@@ -20,8 +26,24 @@ def test_route_width_conversion() -> None:
     assert route_width_projected_m(5.0, 0.05) == 100.0
 
 
+def test_body_gap_conversion() -> None:
+    assert projected_distance_m(0.2, 0.05) == 4.0
+
+
 def test_utm_epsg_for_king_county_area() -> None:
     assert utm_epsg_from_lon_lat(-122.3, 47.6) == 32610
+
+
+def test_mesh_chooses_shorter_top_diagonal() -> None:
+    model = GridModel(
+        x_mm=np.array([0.0, 10.0]),
+        y_mm=np.array([0.0, 10.0]),
+        z_mm=np.array([[0.0, 0.0], [0.0, 10.0]]),
+        cell_mask=np.array([[True]]),
+        base_z_mm=0.0,
+    )
+
+    assert not _use_tl_br_diagonal(model, 0, 0)
 
 
 def test_build_partition_mesh_is_watertight_for_single_cell() -> None:
@@ -45,3 +67,25 @@ def test_build_partition_mesh_empty_mask_returns_empty_mesh() -> None:
 
     assert stats.cells == 0
     assert len(mesh.faces) == 0
+
+
+def test_build_partition_mesh_uses_cell_center_vertex_when_provided() -> None:
+    x_mm = np.array([0.0, 10.0])
+    y_mm = np.array([0.0, 10.0])
+    z_mm = np.array([[5.0, 5.0], [5.0, 5.0]])
+    center_z_mm = np.array([[7.0]])
+    mask = np.array([[True]])
+    mesh, stats = build_partition_mesh(
+        GridModel(
+            x_mm=x_mm,
+            y_mm=y_mm,
+            z_mm=z_mm,
+            cell_mask=mask,
+            base_z_mm=0.0,
+            center_z_mm=center_z_mm,
+        )
+    )
+
+    assert stats.cells == 1
+    assert mesh.is_watertight
+    assert any(np.allclose(vertex, [5.0, 5.0, 7.0]) for vertex in mesh.vertices)

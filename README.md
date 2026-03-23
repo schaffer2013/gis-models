@@ -42,6 +42,7 @@ gis-models build-king-county \
   --kmz-file /path/to/roadtrip.kmz \
   --output-dir out/king-county \
   --route-width-mm 5 \
+  --body-gap-mm 0.2 \
   --grid-resolution 700 \
   --include-water
 ```
@@ -58,6 +59,7 @@ gis-models build-area \
   --output-height-mm 300 \
   --elevation-mm-per-1000-ft 12 \
   --route-width-mm 5 \
+  --body-gap-mm 0.2 \
   --include-water
 ```
 
@@ -83,4 +85,5 @@ The command writes:
 
 - The model is generated from a rasterized surface grid. This keeps the route split robust and ensures the route inherits terrain elevation, but route edges will follow the raster resolution.
 - The water overlay is intentionally best-effort. If OSM water features cannot be downloaded, the build continues without them.
+- `--body-gap-mm` adds extra XY clearance on the terrain-body side around the route insert. A value like `0.2` mm is a reasonable starting point for print fit tuning.
 - The route split is cell-based rather than a full CAD boolean. For print-ready inlays, increase `--grid-resolution` until the route edge fidelity looks good for your printer.

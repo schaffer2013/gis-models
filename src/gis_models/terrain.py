@@ -5,6 +5,7 @@ import warnings
 import geopandas as gpd
 import numpy as np
 import py3dep
+from pyproj import CRS
 from rasterio import features
 from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
@@ -13,19 +14,23 @@ from shapely.geometry import MultiPolygon, Polygon
 from shapely.ops import unary_union
 
 
-def fetch_dem(boundary_gdf: gpd.GeoDataFrame, resolution_m: float) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+def fetch_dem(
+    boundary_gdf: gpd.GeoDataFrame,
+    resolution_m: float,
+) -> tuple[np.ndarray, tuple[float, float, float, float], CRS]:
     boundary_wgs84 = boundary_gdf.to_crs("EPSG:4326")
     geom = boundary_wgs84.geometry.iloc[0]
-    dem = py3dep.get_dem(geom, resolution=resolution_m, crs=str(boundary_gdf.crs))
+    dem = py3dep.get_dem(geom, resolution=resolution_m, crs="EPSG:4326")
     array = np.asarray(dem.squeeze().data, dtype=float)
     if array.ndim != 2:
         raise RuntimeError(f"Expected a 2D DEM, got shape={array.shape!r}")
 
+    dem_crs = CRS.from_user_input(dem.rio.crs)
     x = np.asarray(dem.x, dtype=float)
     y = np.asarray(dem.y, dtype=float)
     bounds = (float(x.min()), float(y.min()), float(x.max()), float(y.max()))
     array = np.flipud(array)
-    return array, bounds
+    return array, bounds, dem_crs
 
 
 

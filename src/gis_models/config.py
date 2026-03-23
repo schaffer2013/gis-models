@@ -17,6 +17,7 @@ class BuildConfig:
     output_height_mm: float = 300.0
     elevation_mm_per_1000_ft: float = 12.0
     route_width_mm: float = 5.0
+    body_gap_mm: float = 0.0
     base_thickness_mm: float = 4.0
     water_drop_mm: float = 0.8
     grid_resolution: int = 700
@@ -47,10 +48,14 @@ def compute_uniform_xy_scale(bounds_m: tuple[float, float, float, float], width_
     return min(width_mm / span_x, height_mm / span_y)
 
 
-def route_width_projected_m(route_width_mm: float, xy_scale_mm_per_m: float) -> float:
+def projected_distance_m(distance_mm: float, xy_scale_mm_per_m: float) -> float:
     if xy_scale_mm_per_m <= 0:
         raise ValueError("xy_scale_mm_per_m must be positive")
-    return route_width_mm / xy_scale_mm_per_m
+    return distance_mm / xy_scale_mm_per_m
+
+
+def route_width_projected_m(route_width_mm: float, xy_scale_mm_per_m: float) -> float:
+    return projected_distance_m(route_width_mm, xy_scale_mm_per_m)
 
 
 def utm_epsg_from_lon_lat(lon: float, lat: float) -> int:
