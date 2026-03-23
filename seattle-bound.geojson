@@ -1,0 +1,26 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "Seattle-SeaTac Corridor",
+        "description": "Boundary including Seattle proper, White Center, Burien, and Sea-Tac Airport."
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-122.436, 47.777], 
+            [-122.235, 47.777], 
+            [-122.235, 47.435], 
+            [-122.345, 47.435], 
+            [-122.345, 47.485], 
+            [-122.436, 47.485], 
+            [-122.436, 47.777]
+          ]
+        ]
+      }
+    }
+  ]
+}
