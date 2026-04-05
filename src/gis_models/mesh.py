@@ -16,16 +16,27 @@ class GridModel:
 
 
 @dataclass(slots=True)
+class LayerModel:
+    x_mm: np.ndarray
+    y_mm: np.ndarray
+    top_z_mm: np.ndarray
+    bottom_z_mm: np.ndarray
+    cell_mask: np.ndarray
+
+
+@dataclass(slots=True)
 class MeshStats:
     vertices: int
     faces: int
     cells: int
 
 
-def build_partition_mesh(model: GridModel) -> tuple[trimesh.Trimesh, MeshStats]:
+def build_layer_mesh(model: LayerModel) -> tuple[trimesh.Trimesh, MeshStats]:
     rows, cols = model.cell_mask.shape
-    if model.z_mm.shape != (rows + 1, cols + 1):
-        raise ValueError("z_mm must be defined on grid corners")
+    if model.top_z_mm.shape != (rows + 1, cols + 1):
+        raise ValueError("top_z_mm must be defined on grid corners")
+    if model.bottom_z_mm.shape != (rows + 1, cols + 1):
+        raise ValueError("bottom_z_mm must be defined on grid corners")
 
     top_vertex_map: dict[tuple[int, int], int] = {}
     bottom_vertex_map: dict[tuple[int, int], int] = {}
@@ -38,7 +49,7 @@ def build_partition_mesh(model: GridModel) -> tuple[trimesh.Trimesh, MeshStats]:
         if idx is None:
             idx = len(vertices)
             top_vertex_map[key] = idx
-            vertices.append([float(model.x_mm[j]), float(model.y_mm[i]), float(model.z_mm[i, j])])
+            vertices.append([float(model.x_mm[j]), float(model.y_mm[i]), float(model.top_z_mm[i, j])])
         return idx
 
     def bottom_idx(i: int, j: int) -> int:
@@ -47,7 +58,7 @@ def build_partition_mesh(model: GridModel) -> tuple[trimesh.Trimesh, MeshStats]:
         if idx is None:
             idx = len(vertices)
             bottom_vertex_map[key] = idx
-            vertices.append([float(model.x_mm[j]), float(model.y_mm[i]), float(model.base_z_mm)])
+            vertices.append([float(model.x_mm[j]), float(model.y_mm[i]), float(model.bottom_z_mm[i, j])])
         return idx
 
     cell_count = int(model.cell_mask.sum())
@@ -99,3 +110,16 @@ def build_partition_mesh(model: GridModel) -> tuple[trimesh.Trimesh, MeshStats]:
     mesh.remove_unreferenced_vertices()
     mesh.fix_normals()
     return mesh, MeshStats(vertices=len(mesh.vertices), faces=len(mesh.faces), cells=cell_count)
+
+
+def build_partition_mesh(model: GridModel) -> tuple[trimesh.Trimesh, MeshStats]:
+    bottom_z_mm = np.full_like(model.z_mm, float(model.base_z_mm))
+    return build_layer_mesh(
+        LayerModel(
+            x_mm=model.x_mm,
+            y_mm=model.y_mm,
+            top_z_mm=model.z_mm,
+            bottom_z_mm=bottom_z_mm,
+            cell_mask=model.cell_mask,
+        )
+    )

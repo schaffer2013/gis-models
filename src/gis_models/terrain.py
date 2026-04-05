@@ -6,18 +6,46 @@ import geopandas as gpd
 import numpy as np
 import py3dep
 from pyproj import CRS
-from rasterio import features
+from rasterio import features, mask
 from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
 from scipy.ndimage import distance_transform_edt
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.ops import unary_union
+from shapely.geometry.base import BaseGeometry
+
+
+def _fetch_dem_from_raster(
+    boundary_gdf: gpd.GeoDataFrame,
+    dem_file,
+) -> tuple[np.ndarray, tuple[float, float, float, float], CRS]:
+    import rasterio
+
+    with rasterio.open(dem_file) as dataset:
+        if dataset.crs is None:
+            raise RuntimeError(f"DEM file {dem_file} does not declare a CRS")
+
+        boundary_in_dem_crs = boundary_gdf.to_crs(dataset.crs)
+        geometry: BaseGeometry = boundary_in_dem_crs.geometry.iloc[0]
+        clipped, transform = mask.mask(dataset, [geometry], crop=True, filled=False, indexes=1)
+        array = np.asarray(clipped.filled(np.nan), dtype=float)
+        if array.ndim != 2:
+            raise RuntimeError(f"Expected a 2D DEM band from {dem_file}, got shape={array.shape!r}")
+
+        bounds = rasterio.transform.array_bounds(array.shape[0], array.shape[1], transform)
+        dem_crs = CRS.from_user_input(dataset.crs)
+        return array, bounds, dem_crs
 
 
 def fetch_dem(
     boundary_gdf: gpd.GeoDataFrame,
     resolution_m: float,
+    *,
+    dem_file=None,
 ) -> tuple[np.ndarray, tuple[float, float, float, float], CRS]:
+    if dem_file is not None:
+        return _fetch_dem_from_raster(boundary_gdf, dem_file)
+
     boundary_wgs84 = boundary_gdf.to_crs("EPSG:4326")
     geom = boundary_wgs84.geometry.iloc[0]
     dem = py3dep.get_dem(geom, resolution=resolution_m, crs="EPSG:4326")

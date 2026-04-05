@@ -1,31 +1,41 @@
 # gis-models
 
-Python tooling to generate a printable terrain solid from GIS data, with a separately printable route inlay that follows the terrain surface.
+Python tooling for an STL-first terrain workflow: correlate a supplied terrain STL to its real NZ footprint, fit it into a target print volume, and split out a separate route insert.
 
-## Scope
+## Current Direction
 
-The project is meant to be usable for **any area**, not just one hard-coded place.
+The project is now centered on this workflow:
 
-- The **example/default preset** is **King County, Washington**.
-- You can also build from:
-  - a **boundary file** (`.geojson`, `.gpkg`, Shapefile, etc.), or
-  - a **U.S. county FIPS pair** (`--state-fips` + `--county-fips`).
+1. Supply a terrain STL for a New Zealand landmass or region.
+2. Supply the real-world boundary for that same area.
+3. Supply a route file.
+4. Supply print-fit parameters:
+   - `max-x-mm`
+   - `max-y-mm`
+   - optional `max-z-mm`
+   - `base-thickness-mm`
+   - optional `water-distance-mm`
+   - `route-thickness-mm`
+   - `gap-xy-mm`
+   - optional `gap-z-mm`
+   - optional `route-width-mm` for line-based routes
+5. The tool correlates the STL to true space, rotates it to use the build area well, then writes:
+   - `terrain_base.stl`
+   - `route_insert.stl`
+   - `metadata.json`
 
-## Default King County example
+## What The NZ STL Workflow Does
 
-The example preset targets **King County, WA**, fitted into a **300 mm × 300 mm** square with a vertical scale of **12 mm per 1000 ft** of elevation.
-
-## What the pipeline does
-
-- Loads an area boundary from a file or Census county geometry.
-- Chooses a projected CRS automatically from the boundary centroid.
-- Pulls a terrain DEM from USGS 3DEP via `py3dep`.
-- Optionally loads a route from a `.kmz` or `.kml` file and buffers it to a printable route width.
-- Optionally fetches OSM water polygons and flattens them into the terrain surface.
-- Generates two watertight meshes:
-  - `terrain_body.stl`
-  - `route_body.stl`
-- Writes a metadata JSON file describing the applied scales and source extents.
+- Loads a user-supplied NZ boundary in `EPSG:2193` by default.
+- Correlates that boundary to the supplied STL footprint with a 2D similarity fit.
+- Chooses a final XY rotation that maximizes usage of the requested `max-x-mm` and `max-y-mm`.
+- Respects `max-z-mm` when provided by limiting relief plus base thickness.
+- Samples the correlated STL surface onto a printable grid.
+- Cuts a route cavity into the base.
+- Keeps the route insert at the requested thickness.
+- Expands the terrain-side cavity by `gap-xy-mm`.
+- Adds optional vertical clearance under the insert with `gap-z-mm`.
+- Optionally extends the model outward into surrounding water by `water-distance-mm`.
 
 ## Install
 
@@ -35,55 +45,75 @@ source .venv/bin/activate
 pip install -e .[dev]
 ```
 
-## Example: King County preset
+## Primary Command
 
 ```bash
-gis-models build-king-county \
-  --kmz-file /path/to/roadtrip.kmz \
-  --output-dir out/king-county \
+gis-models build-nz-stl-route \
+  --terrain-stl /path/to/nz-area.stl \
+  --boundary-file /path/to/nz-area-boundary.gpkg \
+  --route-file /path/to/route.kmz \
+  --output-dir out/nz-route \
+  --area-name "South Island" \
+  --max-x-mm 180 \
+  --max-y-mm 120 \
+  --max-z-mm 24 \
+  --base-thickness-mm 4 \
   --route-width-mm 5 \
-  --body-gap-mm 0.2 \
-  --grid-resolution 700 \
-  --include-water
+  --route-thickness-mm 2.5 \
+  --gap-xy-mm 0.2 \
+  --gap-z-mm 0.0 \
+  --water-distance-mm 3 \
+  --grid-resolution 1200
 ```
 
-## Example: any area from a boundary file
+## Required Inputs
 
-```bash
-gis-models build-area \
-  --area-name "New Zealand" \
-  --boundary-file /path/to/new-zealand.geojson \
-  --kmz-file /path/to/route.kmz \
-  --output-dir out/new-zealand \
-  --output-width-mm 300 \
-  --output-height-mm 300 \
-  --elevation-mm-per-1000-ft 12 \
-  --route-width-mm 5 \
-  --body-gap-mm 0.2 \
-  --include-water
-```
+- `--terrain-stl`: the supplied terrain STL that becomes the terrain source.
+- `--boundary-file`: the real-world polygon boundary for the same NZ area.
+- `--output-dir`: where outputs are written.
+- `--max-x-mm` and `--max-y-mm`: the available print envelope in XY.
+- `--base-thickness-mm`: base thickness under the normalized terrain.
+- `--route-thickness-mm`: true thickness of the route insert.
 
-## Example: any U.S. county by FIPS
+## Common Optional Inputs
 
-```bash
-gis-models build-area \
-  --area-name "Marin County, CA" \
-  --state-fips 06 \
-  --county-fips 041 \
-  --output-dir out/marin-county
-```
+- `--route-file`: route geometry in `.kmz`, `.kml`, or any vector format GeoPandas can read.
+- `--route-width-mm`: printable width of a line route. Default: `5`.
+- `--max-z-mm`: constrains total relief plus base thickness.
+- `--gap-xy-mm`: extra clearance cut only into the terrain body. Default: `0.2`.
+- `--gap-z-mm`: vertical clearance from cavity floor to route insert bottom. Default: `0.0`.
+- `--water-distance-mm`: extra coastal distance beyond land. Default: `0.0`.
+- `--analysis-crs`: defaults to `EPSG:2193`, which is the intended NZ workflow CRS.
 
 ## Outputs
 
-The command writes:
+The NZ STL route command writes:
 
-- `terrain_body.stl`
-- `route_body.stl` (or an empty mesh file if no route cells are present)
+- `terrain_base.stl`
+- `route_insert.stl`
 - `metadata.json`
 
-## Notes and limitations
+`metadata.json` includes:
 
-- The model is generated from a rasterized surface grid. This keeps the route split robust and ensures the route inherits terrain elevation, but route edges will follow the raster resolution.
-- The water overlay is intentionally best-effort. If OSM water features cannot be downloaded, the build continues without them.
-- `--body-gap-mm` adds extra XY clearance on the terrain-body side around the route insert. A value like `0.2` mm is a reasonable starting point for print fit tuning.
-- The route split is cell-based rather than a full CAD boolean. For print-ready inlays, increase `--grid-resolution` until the route edge fidelity looks good for your printer.
+- correlation fit details
+- final print-fit transform
+- build-volume usage
+- route and cavity cell counts
+- output file locations
+
+## Notes
+
+- The STL is the terrain source of truth in this workflow; DEM generation is no longer the main path.
+- The route split is grid-based, not a CAD boolean. Increase `--grid-resolution` if you want crisper route edges.
+- The route insert keeps the requested thickness; the terrain body gets the additional XY and optional Z clearance.
+- If you extend into water, the extra coastal region is inferred from the correlated terrain edge rather than fetched from a DEM.
+
+## Legacy Commands
+
+Older DEM-first commands are still present for now:
+
+- `build-area`
+- `build-king-county`
+- `correlate-nz-reference`
+
+They remain usable, but the NZ STL workflow above is now the intended direction for this project.

@@ -8,9 +8,17 @@ import geopandas as gpd
 import numpy as np
 from scipy import ndimage
 
-from gis_models.config import BuildConfig, compute_uniform_xy_scale, projected_distance_m, route_width_projected_m
+from gis_models.config import (
+    BuildConfig,
+    compute_uniform_xy_scale,
+    compute_z_scale_mm_per_m,
+    projected_distance_m,
+    route_width_projected_m,
+)
+from gis_models.correlation import correlate_new_zealand_reference
 from gis_models.mesh import GridModel, build_partition_mesh
 from gis_models.sources import fetch_water_polygons, load_boundary_geometry, load_route_from_kmz, write_metadata
+from gis_models.stl_build import STLBuildConfig, build_nz_stl_route_model
 from gis_models.terrain import (
     fetch_dem,
     fill_masked_heights,
@@ -97,6 +105,17 @@ def _suppress_high_elevation_spikes(cell_heights: np.ndarray, valid_mask: np.nda
     return filtered
 
 
+def _raise_land_above_sea_level(cell_heights: np.ndarray, valid_mask: np.ndarray, land_raise_m: float) -> np.ndarray:
+    if land_raise_m <= 0:
+        return cell_heights
+
+    raised = cell_heights.copy()
+    land_mask = valid_mask & (raised > 0.0)
+    raised[land_mask] += land_raise_m
+    raised[valid_mask & ~land_mask] = np.maximum(raised[valid_mask & ~land_mask], 0.0)
+    return raised
+
+
 
 def _export_mesh(mesh, path: Path, name: str) -> None:
     if len(mesh.faces) == 0:
@@ -117,7 +136,11 @@ def build_model(config: BuildConfig) -> dict:
         state_fips=config.state_fips,
         county_fips=config.county_fips,
     )
-    terrain_raw_m, raw_bounds, dem_crs = fetch_dem(boundary, resolution_m=config.dem_resolution_m)
+    terrain_raw_m, raw_bounds, dem_crs = fetch_dem(
+        boundary,
+        resolution_m=config.dem_resolution_m,
+        dem_file=config.dem_file,
+    )
     analysis_boundary = boundary.to_crs(dem_crs)
     area_geom = analysis_boundary.geometry.iloc[0]
     raw_area_mask = rasterize_geometry_mask(area_geom, raw_bounds, terrain_raw_m.shape)
@@ -127,7 +150,7 @@ def build_model(config: BuildConfig) -> dict:
     terrain_m = fill_masked_heights(terrain_m, area_mask)
 
     xy_scale = compute_uniform_xy_scale(raw_bounds, config.output_width_mm, config.output_height_mm)
-    z_scale = config.z_mm_per_meter
+    z_scale = compute_z_scale_mm_per_m(config, xy_scale)
 
     route_mask = np.zeros_like(area_mask)
     terrain_gap_mask = np.zeros_like(area_mask)
@@ -161,8 +184,10 @@ def build_model(config: BuildConfig) -> dict:
         except Exception as exc:  # pragma: no cover - network/runtime variability
             print(f"Warning: failed to fetch water polygons ({exc}). Continuing without water.")
 
-    terrain_m = _smooth_low_gradient_heights(terrain_m, area_mask)
-    terrain_m = _suppress_high_elevation_spikes(terrain_m, area_mask)
+    terrain_m = _raise_land_above_sea_level(terrain_m, area_mask, config.land_raise_m)
+    if config.apply_terrain_filters:
+        terrain_m = _smooth_low_gradient_heights(terrain_m, area_mask)
+        terrain_m = _suppress_high_elevation_spikes(terrain_m, area_mask)
     terrain_mm = terrain_m * z_scale
     terrain_mm = flatten_water(terrain_mm, water_mask, config.water_drop_mm)
     corner_z_mm = _corner_heights_from_cell_centers(terrain_mm) + config.base_thickness_mm
@@ -207,6 +232,10 @@ def build_model(config: BuildConfig) -> dict:
         "terrain_mesh": asdict(terrain_stats),
         "route_mesh": asdict(route_stats),
     }
+    metadata["build"]["z_mm_per_meter"] = z_scale
+    metadata["build"]["z_scale_mode"] = (
+        "vertical_exaggeration" if config.vertical_exaggeration is not None else "fixed_mm_per_1000_ft"
+    )
     if route_feature is not None:
         metadata["route_length_m"] = float(gpd.GeoSeries([route_feature], crs=target_crs).length.iloc[0])
 
@@ -219,6 +248,7 @@ def _add_common_build_arguments(parser: argparse.ArgumentParser, *, king_default
     parser.add_argument("--area-name", default=DEFAULT_KING_COUNTY_CONFIG.area_name if king_defaults else "Custom area")
     parser.add_argument("--boundary-file", type=Path, help="Boundary file for any area (GeoJSON, GPKG, Shapefile, etc.).")
     parser.add_argument("--boundary-layer", help="Optional layer name when reading a multi-layer boundary file.")
+    parser.add_argument("--dem-file", type=Path, help="Optional DEM raster file (for example a GeoTIFF) to use instead of downloading USGS 3DEP.")
     parser.add_argument("--state-fips", default=DEFAULT_KING_COUNTY_CONFIG.state_fips if king_defaults else None)
     parser.add_argument("--county-fips", default=DEFAULT_KING_COUNTY_CONFIG.county_fips if king_defaults else None)
     parser.add_argument("--kmz-file", type=Path, help="Optional KMZ/KML route file to inlay into the terrain.")
@@ -239,6 +269,24 @@ def _add_common_build_arguments(parser: argparse.ArgumentParser, *, king_default
     )
     parser.add_argument("--base-thickness-mm", type=float, default=DEFAULT_KING_COUNTY_CONFIG.base_thickness_mm)
     parser.add_argument("--water-drop-mm", type=float, default=DEFAULT_KING_COUNTY_CONFIG.water_drop_mm)
+    parser.add_argument(
+        "--land-raise-m",
+        type=float,
+        default=DEFAULT_KING_COUNTY_CONFIG.land_raise_m,
+        help="Add extra elevation to terrain above sea level before scaling.",
+    )
+    parser.add_argument(
+        "--terrain-filters",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_KING_COUNTY_CONFIG.apply_terrain_filters,
+        help="Apply the built-in smoothing and spike suppression filters.",
+    )
+    parser.add_argument(
+        "--vertical-exaggeration",
+        type=float,
+        default=DEFAULT_KING_COUNTY_CONFIG.vertical_exaggeration,
+        help="If set, derive Z from the XY scale and multiply by this exaggeration factor.",
+    )
     parser.add_argument("--grid-resolution", type=int, default=DEFAULT_KING_COUNTY_CONFIG.grid_resolution)
     parser.add_argument("--dem-resolution-m", type=float, default=DEFAULT_KING_COUNTY_CONFIG.dem_resolution_m)
     parser.add_argument("--include-water", action=argparse.BooleanOptionalAction, default=DEFAULT_KING_COUNTY_CONFIG.include_water)
@@ -248,6 +296,28 @@ def _add_common_build_arguments(parser: argparse.ArgumentParser, *, king_default
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gis-models", description="Generate printable terrain models from GIS data.")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    build_nz_stl = subparsers.add_parser(
+        "build-nz-stl-route",
+        help="Correlate a supplied NZ terrain STL to a real-world boundary and split out a printable route insert.",
+    )
+    build_nz_stl.add_argument("--terrain-stl", type=Path, required=True)
+    build_nz_stl.add_argument("--boundary-file", type=Path, required=True)
+    build_nz_stl.add_argument("--boundary-layer")
+    build_nz_stl.add_argument("--route-file", type=Path)
+    build_nz_stl.add_argument("--output-dir", type=Path, required=True)
+    build_nz_stl.add_argument("--area-name", default="New Zealand terrain")
+    build_nz_stl.add_argument("--max-x-mm", type=float, required=True)
+    build_nz_stl.add_argument("--max-y-mm", type=float, required=True)
+    build_nz_stl.add_argument("--max-z-mm", type=float)
+    build_nz_stl.add_argument("--base-thickness-mm", type=float, required=True)
+    build_nz_stl.add_argument("--route-width-mm", type=float, default=5.0)
+    build_nz_stl.add_argument("--route-thickness-mm", type=float, required=True)
+    build_nz_stl.add_argument("--gap-xy-mm", type=float, default=0.2)
+    build_nz_stl.add_argument("--gap-z-mm", type=float, default=0.0)
+    build_nz_stl.add_argument("--water-distance-mm", type=float, default=0.0)
+    build_nz_stl.add_argument("--grid-resolution", type=int, default=1200)
+    build_nz_stl.add_argument("--analysis-crs", default="EPSG:2193")
 
     build_area = subparsers.add_parser(
         "build-area",
@@ -261,6 +331,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_build_arguments(build_king, king_defaults=True)
 
+    correlate_nz = subparsers.add_parser(
+        "correlate-nz-reference",
+        help="Align the existing North and South Island terrain STLs to a supplied all-islands New Zealand reference STL.",
+    )
+    correlate_nz.add_argument("--reference-stl", type=Path, required=True)
+    correlate_nz.add_argument("--north-boundary", type=Path, required=True)
+    correlate_nz.add_argument("--south-boundary", type=Path, required=True)
+    correlate_nz.add_argument("--north-terrain", type=Path, required=True)
+    correlate_nz.add_argument("--south-terrain", type=Path, required=True)
+    correlate_nz.add_argument("--output-dir", type=Path, required=True)
+    correlate_nz.add_argument(
+        "--scale-z-with-xy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Scale terrain Z by the same factor as XY before writing the aligned STLs.",
+    )
+
     return parser
 
 
@@ -270,6 +357,7 @@ def _config_from_args(args: argparse.Namespace, *, king_county_defaults: bool) -
         area_name=args.area_name,
         boundary_file=args.boundary_file,
         boundary_layer=args.boundary_layer,
+        dem_file=args.dem_file,
         state_fips=args.state_fips,
         county_fips=args.county_fips,
         output_width_mm=args.output_width_mm,
@@ -279,6 +367,9 @@ def _config_from_args(args: argparse.Namespace, *, king_county_defaults: bool) -
         body_gap_mm=args.body_gap_mm,
         base_thickness_mm=args.base_thickness_mm,
         water_drop_mm=args.water_drop_mm,
+        land_raise_m=args.land_raise_m,
+        apply_terrain_filters=args.terrain_filters,
+        vertical_exaggeration=args.vertical_exaggeration,
         grid_resolution=args.grid_resolution,
         dem_resolution_m=args.dem_resolution_m,
         include_water=args.include_water,
@@ -297,16 +388,61 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.command == "build-area":
+    if args.command == "build-nz-stl-route":
+        metadata = build_nz_stl_route_model(
+            STLBuildConfig(
+                terrain_stl=args.terrain_stl,
+                boundary_file=args.boundary_file,
+                boundary_layer=args.boundary_layer,
+                route_file=args.route_file,
+                output_dir=args.output_dir,
+                area_name=args.area_name,
+                max_x_mm=args.max_x_mm,
+                max_y_mm=args.max_y_mm,
+                max_z_mm=args.max_z_mm,
+                base_thickness_mm=args.base_thickness_mm,
+                route_width_mm=args.route_width_mm,
+                route_thickness_mm=args.route_thickness_mm,
+                gap_xy_mm=args.gap_xy_mm,
+                gap_z_mm=args.gap_z_mm,
+                water_distance_mm=args.water_distance_mm,
+                grid_resolution=args.grid_resolution,
+                analysis_crs=args.analysis_crs,
+            )
+        )
+    elif args.command == "build-area":
         metadata = build_model(_config_from_args(args, king_county_defaults=False))
     elif args.command == "build-king-county":
         metadata = build_model(_config_from_args(args, king_county_defaults=True))
+    elif args.command == "correlate-nz-reference":
+        metadata = correlate_new_zealand_reference(
+            reference_stl=args.reference_stl,
+            north_boundary=args.north_boundary,
+            south_boundary=args.south_boundary,
+            north_terrain=args.north_terrain,
+            south_terrain=args.south_terrain,
+            output_dir=args.output_dir,
+            scale_z_with_xy=args.scale_z_with_xy,
+        )
+        print(f"Wrote correlation outputs to {args.output_dir}")
+        print(
+            "Matched reference components: "
+            f"north={metadata['matches']['north_island']['reference_component_index']}, "
+            f"south={metadata['matches']['south_island']['reference_component_index']}"
+        )
+        return 0
     else:
         parser.error(f"Unknown command: {args.command}")
         return 2
 
     print(f"Wrote outputs to {args.output_dir}")
-    print(f"Route cells: {metadata['route_cells']}; water cells: {metadata['water_cells']}")
+    if args.command == "build-nz-stl-route":
+        print(
+            "Route cells: "
+            f"{metadata['route']['route_cells']}; cavity cells: {metadata['route']['cavity_cells']}"
+        )
+    else:
+        print(f"Route cells: {metadata['route_cells']}; water cells: {metadata['water_cells']}")
     return 0
 
 

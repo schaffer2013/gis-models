@@ -4,13 +4,14 @@ import numpy as np
 
 from gis_models.config import (
     BuildConfig,
+    compute_z_scale_mm_per_m,
     compute_uniform_xy_scale,
     projected_distance_m,
     route_width_projected_m,
     utm_epsg_from_lon_lat,
 )
-from gis_models.cli import _smooth_low_gradient_heights, _suppress_high_elevation_spikes
-from gis_models.mesh import GridModel, build_partition_mesh
+from gis_models.cli import _raise_land_above_sea_level, _smooth_low_gradient_heights, _suppress_high_elevation_spikes
+from gis_models.mesh import GridModel, LayerModel, build_layer_mesh, build_partition_mesh
 
 
 def test_z_scale_matches_requested_ratio() -> None:
@@ -21,6 +22,12 @@ def test_z_scale_matches_requested_ratio() -> None:
 def test_xy_scale_fits_larger_span() -> None:
     scale = compute_uniform_xy_scale((0.0, 0.0, 6000.0, 3000.0), 300.0, 300.0)
     assert scale == 0.05
+
+
+def test_vertical_exaggeration_uses_xy_scale() -> None:
+    config = BuildConfig(vertical_exaggeration=1.7)
+
+    assert compute_z_scale_mm_per_m(config, 0.05) == 0.085
 
 
 def test_route_width_conversion() -> None:
@@ -55,6 +62,24 @@ def test_highland_spike_suppression_reduces_isolated_peak() -> None:
     assert np.allclose(filtered[0, 0], heights[0, 0])
 
 
+def test_land_raise_only_applies_above_sea_level() -> None:
+    heights = np.array([
+        [-10.0, 0.0, 5.0],
+        [20.0, -2.0, 1.0],
+    ])
+    valid_mask = np.ones_like(heights, dtype=bool)
+
+    raised = _raise_land_above_sea_level(heights, valid_mask, 300.0)
+
+    assert np.allclose(
+        raised,
+        np.array([
+            [0.0, 0.0, 305.0],
+            [320.0, 0.0, 301.0],
+        ]),
+    )
+
+
 def test_build_partition_mesh_is_watertight_for_single_cell() -> None:
     x_mm = np.array([0.0, 10.0])
     y_mm = np.array([0.0, 10.0])
@@ -76,3 +101,26 @@ def test_build_partition_mesh_empty_mask_returns_empty_mesh() -> None:
 
     assert stats.cells == 0
     assert len(mesh.faces) == 0
+
+
+def test_build_layer_mesh_supports_variable_bottom_surface() -> None:
+    x_mm = np.array([0.0, 10.0])
+    y_mm = np.array([0.0, 10.0])
+    top_z_mm = np.array([[6.0, 6.0], [6.0, 6.0]])
+    bottom_z_mm = np.array([[2.0, 2.0], [2.0, 2.0]])
+    mask = np.array([[True]])
+
+    mesh, stats = build_layer_mesh(
+        LayerModel(
+            x_mm=x_mm,
+            y_mm=y_mm,
+            top_z_mm=top_z_mm,
+            bottom_z_mm=bottom_z_mm,
+            cell_mask=mask,
+        )
+    )
+
+    assert stats.cells == 1
+    assert mesh.is_watertight
+    assert mesh.bounds[0, 2] == 2.0
+    assert mesh.bounds[1, 2] == 6.0

@@ -11,6 +11,7 @@ class BuildConfig:
     area_name: str = "King County, WA"
     boundary_file: Path | None = None
     boundary_layer: str | None = None
+    dem_file: Path | None = None
     state_fips: str | None = "53"
     county_fips: str | None = "033"
     output_width_mm: float = 300.0
@@ -20,6 +21,9 @@ class BuildConfig:
     body_gap_mm: float = 0.0
     base_thickness_mm: float = 4.0
     water_drop_mm: float = 0.8
+    land_raise_m: float = 0.0
+    apply_terrain_filters: bool = True
+    vertical_exaggeration: float | None = None
     grid_resolution: int = 700
     include_water: bool = True
     dem_resolution_m: float = 90.0
@@ -35,6 +39,7 @@ class BuildConfig:
         payload["output_dir"] = str(self.output_dir)
         payload["kmz_file"] = str(self.kmz_file) if self.kmz_file else None
         payload["boundary_file"] = str(self.boundary_file) if self.boundary_file else None
+        payload["dem_file"] = str(self.dem_file) if self.dem_file else None
         payload["z_mm_per_meter"] = self.z_mm_per_meter
         return payload
 
@@ -56,6 +61,14 @@ def projected_distance_m(distance_mm: float, xy_scale_mm_per_m: float) -> float:
 
 def route_width_projected_m(route_width_mm: float, xy_scale_mm_per_m: float) -> float:
     return projected_distance_m(route_width_mm, xy_scale_mm_per_m)
+
+
+def compute_z_scale_mm_per_m(config: BuildConfig, xy_scale_mm_per_m: float) -> float:
+    if config.vertical_exaggeration is not None:
+        if config.vertical_exaggeration <= 0:
+            raise ValueError("vertical_exaggeration must be positive")
+        return xy_scale_mm_per_m * config.vertical_exaggeration
+    return config.z_mm_per_meter
 
 
 def utm_epsg_from_lon_lat(lon: float, lat: float) -> int:

@@ -97,6 +97,22 @@ def load_route_from_kmz(path: Path, *, target_crs: CRS) -> LineString | MultiLin
     return unary_union(route_wgs84.geometry.tolist())
 
 
+def load_route_geometry(path: Path, *, target_crs: CRS):
+    suffix = path.suffix.lower()
+    if suffix in {".kml", ".kmz"}:
+        return load_route_from_kmz(path, target_crs=target_crs)
+
+    route = gpd.read_file(path)
+    if route.empty:
+        raise RuntimeError(f"Route file {path} did not contain any features")
+    if route.crs is None:
+        raise RuntimeError(f"Route file {path} does not declare a CRS")
+
+    geometry = unary_union([geom for geom in route.to_crs(target_crs).geometry if geom and not geom.is_empty])
+    if geometry.is_empty:
+        raise RuntimeError(f"Route file {path} did not contain usable geometry")
+    return geometry
+
 
 def fetch_water_polygons(boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoSeries:
     try:
